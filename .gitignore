@@ -1,0 +1,15 @@
+# NEVER commit API keys
+grok_api_key.txt
+*.key
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
