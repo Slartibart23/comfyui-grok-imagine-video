@@ -6,8 +6,8 @@ ComfyUI custom nodes for the **official xAI Grok Imagine API** — image generat
 
 | Node | Purpose |
 |---|---|
-| **Grok Imagine Generate (xAI)** | Text-to-image via `/v1/images/generations`. `grok-imagine-image-2.0` (default) with `quality` auto/low/medium, up to 10 images per request, 16 aspect ratios incl. `auto`, `21:9`, `5:2`, resolution 1k/2k. Outputs `images`, `prompt`, `info` (model, moderation flag, billed cost). |
-| **Grok Imagine Edit 1-5 Images (xAI)** | Image editing via `/v1/images/edits` with up to **five** source images (`image_1` required). Order matters; the output keeps the first image's ratio unless overridden. |
+| **Grok Imagine Generate (xAI)** | Text-to-image via `/v1/images/generations`. `grok-imagine-image-2.0` (default), `resolution` 1k/2k, `quality` low/medium/auto, up to 10 images per request, 16 aspect ratios incl. `auto`, `21:9`, `5:2`. Outputs `images`, `prompt`, `info` (served model, true pixel size, moderation flag, estimated + billed cost). |
+| **Grok Imagine Edit 1-5 Images (xAI)** | Image editing via `/v1/images/edits` with up to **five** source images (`image_1` required, refer to them as "image 1", "image 2" in the prompt). `resolution` source/1k/2k, `quality` (default medium), lossless PNG upload with selectable size. Output keeps the first image's ratio unless overridden. |
 | **Grok Imagine Video (xAI)** | One node for all three generation modes: **text-to-video** (nothing connected), **image-to-video** (`image` connected = first frame), **reference-to-video** (`reference_images` batch of up to 7 + optional `voice_ids`). Duration 1-15 s, 480p/720p/1080p, `generate_audio`. Submits, polls, downloads the MP4 and outputs `frames`, `fps`, `audio`, `video` (native VIDEO), `video_path`, `prompt`, `info`. |
 | **Grok Imagine Video Edit (xAI)** | Modify an existing MP4 (≤ 8.7 s) with a prompt via `/v1/videos/edits`. Same outputs. |
 | **Grok Imagine Video Extend (xAI)** | Continue an MP4 from its last frame by `duration` seconds via `/v1/videos/extensions`. Same outputs. |
@@ -48,6 +48,17 @@ Extend a clip you just generated:
 | `poll_*` | Long 1080p jobs can take minutes; raise `poll_timeout_seconds` if needed. |
 
 `info` contains the model the API used, duration, `respect_moderation` and the exact billed cost (`cost_in_usd_ticks` → USD).
+
+## Image size vs. quality (read this once)
+
+Two independent switches, both on Generate and Edit:
+
+| Widget | Meaning | Values | Price on image-2.0 |
+|---|---|---|---|
+| `resolution` | **pixel size** | `1k` (~1 MP, e.g. 1024x1024 / 1344x768) · `2k` (~4 MP, e.g. 2048x2048 / 2688x1536) | 2k = +$0.02 per image |
+| `quality` | **detail / compute tier** | `low` · `medium` · `auto` (API picks: low for generate, medium for edit) · `default` (not sent = auto) | 1k/low $0.04 · 2k/low $0.06 · 1k/medium $0.06 · 2k/medium $0.08 |
+
+Edits additionally bill **$0.01 per source image**. The console prints the estimated total before each request; `info` shows the real amount xAI billed and the true pixel size that came back.
 
 ## Model notes (September 2026)
 

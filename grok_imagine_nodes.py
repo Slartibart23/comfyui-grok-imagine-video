@@ -3,7 +3,15 @@ Grok Imagine — ComfyUI custom nodes
 Image generation, multi-image editing, video generation / editing / extension
 via the official xAI Grok Imagine API.
 
-v2.0.0 (September 2026)
+v2.1.0 (September 2026)
+- Image: `resolution` (1k/2k) now also on the Edit node; explicit `quality`
+  defaults (low for generation, medium for editing) so the billed tier is
+  visible; cost estimate before every request and the real billed cost after;
+  `info` reports the true pixel size of every returned image; lossless PNG
+  upload with selectable size for edit sources; `fail_on_moderation`;
+  retirement warning for grok-imagine-image-quality; tooltips on every
+  input AND output.
+v2.0.0
 - Image: grok-imagine-image-2.0 default with `quality` (auto/low/medium),
   aspect ratios 21:9 and 5:2, edit node accepts up to 5 source images.
   (grok-imagine-image-quality is retired on 2026-11-02.)
@@ -53,6 +61,60 @@ IMAGE_ASPECT_RATIOS = ["auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"
 VIDEO_ASPECT_RATIOS = ["default", "16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3"]
 VIDEO_RESOLUTIONS = ["default", "480p", "720p", "1080p"]
 IMAGE_QUALITY = ["default", "auto", "low", "medium"]
+IMAGE_RESOLUTIONS = ["1k", "2k"]
+EDIT_RESOLUTIONS = ["source", "1k", "2k"]
+UPLOAD_FORMATS = ["png", "jpg"]
+
+# Published xAI list prices (USD per image), docs.x.ai/developers/models, 2026-09-05.
+# Used only for the console/info ESTIMATE; the real amount comes back from the
+# API as usage.cost_in_usd_ticks and is reported separately.
+IMAGE_PRICES = {
+    "grok-imagine-image-2.0": {
+        "input": 0.01,
+        "output": {("1k", "low"): 0.04, ("2k", "low"): 0.06,
+                   ("1k", "medium"): 0.06, ("2k", "medium"): 0.08},
+    },
+    "grok-imagine-image": {
+        "input": 0.002,
+        "output": {("1k", "*"): 0.02, ("2k", "*"): 0.02},
+    },
+    "grok-imagine-image-quality": {  # retired 2026-11-02 -> billed as 2.0/low
+        "input": 0.01,
+        "output": {("1k", "*"): 0.05, ("2k", "*"): 0.07},
+    },
+}
+RETIRED_IMAGE_MODELS = {"grok-imagine-image-quality": "2026-11-02",
+                        "grok-imagine-image-pro": "2026-11-02"}
+
+
+def _effective_quality(model, quality, is_edit):
+    """What the API will actually serve/bill for the requested quality."""
+    if not model.startswith("grok-imagine-image-2.0"):
+        return "*"
+    if quality in ("default", "auto"):
+        return "medium" if is_edit else "low"
+    return quality
+
+
+def _estimate_image_cost(model, resolution, quality, n, n_inputs, is_edit):
+    """Returns (estimate_usd or None, human string)."""
+    matches = [k for k in IMAGE_PRICES if model.startswith(k)]
+    key = max(matches, key=len) if matches else None  # longest prefix wins
+    if key is None:
+        return None, "no list price known for this model"
+    prices = IMAGE_PRICES[key]
+    q = _effective_quality(model, quality, is_edit)
+    res = resolution if resolution in ("1k", "2k") else "1k"
+    out = prices["output"].get((res, q)) or prices["output"].get((res, "*"))
+    if out is None:
+        return None, "unknown resolution/quality combination"
+    total = n * out + n_inputs * prices["input"]
+    parts = []
+    if n_inputs:
+        parts.append(f"{n_inputs} input x ${prices['input']:.3f}")
+    tier = f"{res.upper()} {q}" if q != "*" else res.upper()
+    parts.append(f"{n} output x ${out:.2f} ({tier})")
+    return total, " + ".join(parts) + f" = ${total:.3f}"
 
 DEFAULT_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_KEY_FILE = "grok_api_key.txt"
@@ -230,6 +292,47 @@ def _summarize_image_info(data, requested_model, tag):
             parts.append(f"respect_moderation={item['respect_moderation']}")
         if item.get("revised_prompt"):
             parts.append(f"revised_prompt={item['revised_prompt']}")
+    c = _cost_str(data)
+    if c:
+        parts.append(c)
+    return "; ".join(parts)
+
+
+def _warn_if_retired(model_id, tag):
+    for m, date in RETIRED_IMAGE_MODELS.items():
+        if model_id.startswith(m):
+            print(f"[{tag}] WARNING: '{model_id}' is retired by xAI on {date}; requests "
+                  f"are served by grok-imagine-image-2.0 at low quality and billed at "
+                  f"that rate. Switch the model dropdown to grok-imagine-image-2.0.")
+
+
+def _image_result_info(data, arrays, requested_model, resolution, quality, est, tag,
+                       fail_on_moderation, n_inputs=0):
+    """info string with the facts a user can verify: served model, true pixel
+    sizes, requested tiers, moderation, estimated vs billed cost."""
+    parts = [f"model={data.get('model', requested_model)}"]
+    sizes = [f"{a.shape[1]}x{a.shape[0]}" for a in arrays]
+    if len(set(sizes)) == 1:
+        parts.append(f"size={sizes[0]}" + (f" x{len(sizes)}" if len(sizes) > 1 else ""))
+    else:
+        parts.append("sizes=" + ",".join(sizes))
+    parts.append(f"resolution={resolution}")
+    parts.append(f"quality={quality}")
+    if n_inputs:
+        parts.append(f"inputs={n_inputs}")
+    flags = [it.get("respect_moderation") for it in data.get("data", [])
+             if "respect_moderation" in it]
+    if flags:
+        parts.append(f"respect_moderation={all(flags)}")
+        if fail_on_moderation and not all(flags):
+            raise RuntimeError(f"[{tag}] Result was filtered by content moderation "
+                               f"(respect_moderation=false). fail_on_moderation is on.")
+    for it in data.get("data", []):
+        if it.get("revised_prompt"):
+            parts.append(f"revised_prompt={it['revised_prompt']}")
+            break
+    if est is not None:
+        parts.append(f"est_cost_usd={est:.3f}")
     c = _cost_str(data)
     if c:
         parts.append(c)
@@ -447,13 +550,32 @@ TT_EXTRACT_FRAMES = ("Decode the MP4 into an IMAGE batch on the 'frames' output.
 TT_EXTRACT_AUDIO = ("Decode the video's audio track to the 'audio' output (AUDIO). Needs "
                     "ffmpeg (bundled with imageio-ffmpeg). Off = silent placeholder.")
 TT_ASPECT_IMG = ("Output aspect ratio. 'auto' lets the model pick based on the prompt. "
-                 "21:9 = cinematic widescreen, 5:2 = wide banner.")
-TT_RES_IMG = "Output size class: 1k is faster and cheaper, 2k has more detail."
-TT_QUALITY = ("Quality tier of grok-imagine-image-2.0 (billed per tier). default = do "
-              "not send (API picks auto). auto = low for generation, medium for "
-              "editing. low = cheapest/fastest. medium = best fidelity. Older image "
-              "models ignore or reject this — keep 'default' for them.")
-TT_N = "How many images to generate in one request (1-10). Each one is billed."
+                 "21:9 = cinematic widescreen, 5:2 = wide banner, 19.5:9 / 20:9 = "
+                 "phone screens. Pixel size = this ratio x the resolution class.")
+TT_RES_IMG = ("IMAGE SIZE. The API offers exactly two classes: 1k (about 1 megapixel, "
+              "e.g. 1024x1024 or 1344x768) and 2k (about 4 megapixels, e.g. 2048x2048 "
+              "or 2688x1536). Independent of 'quality'. Price impact on image-2.0: "
+              "+$0.02 per image for 2k. The real pixel size of every result is shown "
+              "on the 'info' output.")
+TT_QUALITY = ("DETAIL / COMPUTE TIER, NOT image size (see resolution). image-2.0 only. "
+              "low: fastest, cheapest. medium: more compute per image - finer detail in "
+              "skin, fabric, small text; recommended for edits and final renders. "
+              "auto: the API decides (currently low for generation, medium for editing) "
+              "and bills what it served. default: parameter not sent (= auto). "
+              "Prices per image: 1k/low $0.04, 2k/low $0.06, 1k/medium $0.06, "
+              "2k/medium $0.08. Older models ignore this - keep 'default' there.")
+TT_N = ("How many images to generate in one request (1-10). Every image is billed; "
+        "the console prints the estimated total before the request.")
+TT_FAIL_MOD = ("If the API flags a result as not passing content moderation "
+               "(respect_moderation=false), stop the queue with an error instead of "
+               "silently passing the filtered image on. The request is billed either "
+               "way; 'info' always shows the flag.")
+TT_UPLOAD_FMT = ("How source images are encoded for upload. png = lossless (best for "
+                 "preserving identity, text and fine detail). jpg = smaller/faster "
+                 "upload at quality 95, tiny loss.")
+TT_UPLOAD_SIDE = ("Source images are downscaled so their longer side is at most this "
+                  "many pixels before upload. 2048 keeps full 2k detail; 4096 sends "
+                  "originals up to 4k (slower upload, API limit 20 MiB per image).")
 
 
 # ---------------------------------------------------------------------------
@@ -463,22 +585,36 @@ class GrokImagineGenerate:
     CATEGORY = "Grok/Imagine"
     RETURN_TYPES = ("IMAGE", "STRING", "STRING")
     RETURN_NAMES = ("images", "prompt", "info")
+    OUTPUT_TOOLTIPS = (
+        "All generated images as one IMAGE batch (n images, same size). Connect to "
+        "Preview/Save Image, an upscaler, or the Edit/Video nodes.",
+        "The prompt exactly as sent, for Save nodes (prompt_text) or captions.",
+        "One line of facts about this request: model the API used, true pixel size "
+        "of each image, requested resolution/quality, moderation flag, estimated "
+        "and real billed cost in USD.",
+    )
     FUNCTION = "generate"
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "prompt": ("STRING", {"multiline": True, "default": "", "tooltip": TT_PROMPT}),
+                "prompt": ("STRING", {"multiline": True, "default": "", "tooltip":
+                    "What to generate. image-2.0 follows detailed instructions closely: "
+                    "name subject, action, setting, camera, light and style in plain "
+                    "sentences. It is strong at typography - put any text in quotes "
+                    "and say where it goes. No negative prompt exists; say what you want "
+                    "instead of what you don't."}),
                 "model": (IMAGE_MODELS, {"default": IMAGE_MODELS[0], "tooltip":
-                    "Image model. grok-imagine-image-2.0 is current (Aurora engine, "
-                    "sharp text rendering, quality tiers). grok-imagine-image = 1.0. "
-                    "grok-imagine-image-quality is retired on 2026-11-02 and then "
-                    "redirects to 2.0 at low quality."}),
+                    "Image model. grok-imagine-image-2.0 is current (best quality, "
+                    "sharp text, quality tiers, 15 ratios, 5 edit sources). "
+                    "grok-imagine-image = 1.0, $0.02/image, lower quality. "
+                    "grok-imagine-image-quality is RETIRED on 2026-11-02 and then served "
+                    "by 2.0 at low quality."}),
                 "n": ("INT", {"default": 1, "min": 1, "max": 10, "tooltip": TT_N}),
                 "aspect_ratio": (IMAGE_ASPECT_RATIOS, {"default": "auto", "tooltip": TT_ASPECT_IMG}),
-                "resolution": (["1k", "2k"], {"default": "1k", "tooltip": TT_RES_IMG}),
-                "quality": (IMAGE_QUALITY, {"default": "default", "tooltip": TT_QUALITY}),
+                "resolution": (IMAGE_RESOLUTIONS, {"default": "1k", "tooltip": TT_RES_IMG}),
+                "quality": (IMAGE_QUALITY, {"default": "low", "tooltip": TT_QUALITY}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
                                  "control_after_generate": True, "tooltip":
                     "Cache-breaker only (not sent to the API; results are not "
@@ -486,6 +622,7 @@ class GrokImagineGenerate:
                     "reuse the cached result for identical settings (no cost)."}),
             },
             "optional": {
+                "fail_on_moderation": ("BOOLEAN", {"default": False, "tooltip": TT_FAIL_MOD}),
                 "custom_model": ("STRING", {"default": "", "tooltip": TT_CUSTOM_MODEL}),
                 "api_key": ("STRING", {"default": "", "tooltip": TT_API_KEY}),
                 "api_key_file": ("STRING", {"default": DEFAULT_KEY_FILE, "tooltip": TT_API_KEY_FILE}),
@@ -494,12 +631,14 @@ class GrokImagineGenerate:
             },
         }
 
-    def generate(self, prompt, model, n, aspect_ratio, resolution, quality="default",
-                 seed=0, custom_model="", api_key="", api_key_file=DEFAULT_KEY_FILE,
-                 base_url=DEFAULT_BASE_URL, timeout_seconds=300):
+    def generate(self, prompt, model, n, aspect_ratio, resolution, quality="low",
+                 seed=0, fail_on_moderation=False, custom_model="", api_key="",
+                 api_key_file=DEFAULT_KEY_FILE, base_url=DEFAULT_BASE_URL,
+                 timeout_seconds=300):
         tag = "Grok Imagine Generate"
         key = _resolve_api_key(api_key, api_key_file)
         model_id = _pick_model(model, custom_model)
+        _warn_if_retired(model_id, tag)
         payload = {
             "model": model_id,
             "prompt": prompt,
@@ -508,18 +647,20 @@ class GrokImagineGenerate:
             "aspect_ratio": aspect_ratio,
             "response_format": "b64_json",
         }
-        if quality != "default":
+        if quality != "default" and model_id.startswith("grok-imagine-image-2.0"):
             payload["quality"] = quality
+        est, est_str = _estimate_image_cost(model_id, resolution, quality, int(n), 0, False)
         print(f"[{tag}] -> model={model_id} n={n} ratio={aspect_ratio} res={resolution} "
-              f"quality={quality}")
+              f"quality={quality} | estimated cost: {est_str}")
         data = _post_json(base_url.rstrip("/") + "/images/generations", key, payload,
                           timeout_seconds, tag)
         items = data.get("data") or []
         if not items:
             raise RuntimeError(f"[{tag}] Empty response: {str(data)[:500]}")
         arrays = [_b64_or_url_to_array(it, timeout_seconds) for it in items]
-        info = _summarize_image_info(data, model_id, tag)
-        print(f"[{tag}] <- {len(arrays)} image(s). {info}")
+        info = _image_result_info(data, arrays, model_id, resolution, quality, est, tag,
+                                  fail_on_moderation)
+        print(f"[{tag}] <- {info}")
         return (_stack_images(arrays), prompt, info)
 
 
@@ -530,35 +671,65 @@ class GrokImagineEdit:
     CATEGORY = "Grok/Imagine"
     RETURN_TYPES = ("IMAGE", "STRING", "STRING")
     RETURN_NAMES = ("image", "prompt", "info")
+    OUTPUT_TOOLTIPS = (
+        "The edited result(s) as an IMAGE batch (n images). Feed it back into "
+        "image_1 of another Edit node for multi-turn refinement.",
+        "The editing prompt exactly as sent, for Save nodes or captions.",
+        "Facts about this request: model used, true pixel size, number of source "
+        "images, requested resolution/quality, moderation flag, estimated and real "
+        "billed cost in USD.",
+    )
     FUNCTION = "edit"
 
     @classmethod
     def INPUT_TYPES(cls):
-        extra_img = {"tooltip": "Optional additional source image. Order matters: refer "
-                                "to them in the prompt as the first, second... image."}
+        def img_tt(i):
+            return {"tooltip":
+                f"Source image #{i} (optional). Refer to it in the prompt as 'image {i}' / "
+                f"'the {['first','second','third','fourth','fifth'][i-1]} image'. Each "
+                f"connected image is billed $0.01 as input. Up to 5 in total; combine "
+                f"e.g. a person + a garment + a background."}
         return {
             "required": {
-                "image_1": ("IMAGE", {"tooltip": "Main source image. The output keeps its "
-                                                 "aspect ratio unless aspect_ratio overrides it."}),
+                "image_1": ("IMAGE", {"tooltip":
+                    "Main source image (required). The result keeps its aspect ratio "
+                    "unless aspect_ratio overrides it. Refer to it as 'image 1' in the "
+                    "prompt. Billed $0.01 as input."}),
                 "prompt": ("STRING", {"multiline": True, "default": "", "tooltip":
-                    "Editing instruction, e.g. 'give her a red coat' or 'put the product "
-                    "from the second image on the table'."}),
+                    "What to change. Be concrete and name the sources: 'the woman from "
+                    "image 1 wearing the dress from image 2, standing, full body'. Say "
+                    "what to keep ('preserve her face and hair'), what to remove, and the "
+                    "camera/lens if it matters. image-2.0 preserves identity, style and "
+                    "layout across repeated edits - chain Edit nodes for step-by-step work."}),
                 "model": (IMAGE_MODELS, {"default": IMAGE_MODELS[0], "tooltip":
-                    "Image model used for editing (2.0 recommended)."}),
+                    "Image model used for editing. grok-imagine-image-2.0 recommended "
+                    "(#2 on the Arena image-edit board, up to 5 sources). Older models "
+                    "accept 3 sources at most."}),
                 "aspect_ratio": (["source"] + IMAGE_ASPECT_RATIOS, {"default": "source",
-                    "tooltip": "'source' keeps the first input image's ratio; any other "
-                               "value re-frames the result."}),
-                "quality": (IMAGE_QUALITY, {"default": "default", "tooltip": TT_QUALITY}),
+                    "tooltip": "'source' = keep the ratio of image_1 (parameter not sent). "
+                               "Any other value re-frames the result; the model fills the "
+                               "new frame instead of stretching. Pixel size = ratio x "
+                               "resolution."}),
+                "resolution": (EDIT_RESOLUTIONS, {"default": "source", "tooltip":
+                    "IMAGE SIZE of the result. source = parameter not sent (API default, "
+                    "currently 1k). 1k = about 1 megapixel, 2k = about 4 megapixels "
+                    "(+$0.02 per image). Independent of quality. The real pixel size is "
+                    "shown on 'info'."}),
+                "quality": (IMAGE_QUALITY, {"default": "medium", "tooltip": TT_QUALITY}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
                                  "control_after_generate": True, "tooltip":
                     "Cache-breaker only (not sent). randomize = new request each run."}),
             },
             "optional": {
-                "image_2": ("IMAGE", extra_img),
-                "image_3": ("IMAGE", extra_img),
-                "image_4": ("IMAGE", extra_img),
-                "image_5": ("IMAGE", extra_img),
+                "image_2": ("IMAGE", img_tt(2)),
+                "image_3": ("IMAGE", img_tt(3)),
+                "image_4": ("IMAGE", img_tt(4)),
+                "image_5": ("IMAGE", img_tt(5)),
                 "n": ("INT", {"default": 1, "min": 1, "max": 10, "tooltip": TT_N}),
+                "upload_format": (UPLOAD_FORMATS, {"default": "png", "tooltip": TT_UPLOAD_FMT}),
+                "upload_max_side": ("INT", {"default": 2048, "min": 512, "max": 4096,
+                                            "step": 64, "tooltip": TT_UPLOAD_SIDE}),
+                "fail_on_moderation": ("BOOLEAN", {"default": False, "tooltip": TT_FAIL_MOD}),
                 "custom_model": ("STRING", {"default": "", "tooltip": TT_CUSTOM_MODEL}),
                 "api_key": ("STRING", {"default": "", "tooltip": TT_API_KEY}),
                 "api_key_file": ("STRING", {"default": DEFAULT_KEY_FILE, "tooltip": TT_API_KEY_FILE}),
@@ -567,18 +738,22 @@ class GrokImagineEdit:
             },
         }
 
-    def edit(self, image_1, prompt, model, aspect_ratio, quality="default", seed=0,
-             image_2=None, image_3=None, image_4=None, image_5=None, n=1,
-             custom_model="", api_key="", api_key_file=DEFAULT_KEY_FILE,
-             base_url=DEFAULT_BASE_URL, timeout_seconds=300):
+    def edit(self, image_1, prompt, model, aspect_ratio, resolution="source",
+             quality="medium", seed=0, image_2=None, image_3=None, image_4=None,
+             image_5=None, n=1, upload_format="png", upload_max_side=2048,
+             fail_on_moderation=False, custom_model="", api_key="",
+             api_key_file=DEFAULT_KEY_FILE, base_url=DEFAULT_BASE_URL,
+             timeout_seconds=300):
         tag = "Grok Imagine Edit"
         key = _resolve_api_key(api_key, api_key_file)
         model_id = _pick_model(model, custom_model)
+        _warn_if_retired(model_id, tag)
 
-        uris = [_tensor_to_data_uri(image_1)]
+        fmt = "png" if upload_format == "png" else "jpeg"
+        uris = [_tensor_to_data_uri(image_1, max_side=upload_max_side, fmt=fmt)]
         for extra in (image_2, image_3, image_4, image_5):
             if extra is not None:
-                uris.append(_tensor_to_data_uri(extra))
+                uris.append(_tensor_to_data_uri(extra, max_side=upload_max_side, fmt=fmt))
 
         payload = {
             "model": model_id,
@@ -592,18 +767,26 @@ class GrokImagineEdit:
             payload["images"] = [{"type": "image_url", "url": u} for u in uris]
         if aspect_ratio != "source":
             payload["aspect_ratio"] = aspect_ratio
-        if quality != "default":
+        if resolution != "source":
+            payload["resolution"] = resolution
+        if quality != "default" and model_id.startswith("grok-imagine-image-2.0"):
             payload["quality"] = quality
 
-        print(f"[{tag}] -> model={model_id} sources={len(uris)} n={n} quality={quality}")
+        est, est_str = _estimate_image_cost(model_id, resolution, quality, int(n),
+                                            len(uris), True)
+        upload_mb = sum(len(u) for u in uris) * 3 / 4 / (1024 * 1024)
+        print(f"[{tag}] -> model={model_id} sources={len(uris)} ({upload_mb:.1f} MB "
+              f"{upload_format}) n={n} res={resolution} quality={quality} | "
+              f"estimated cost: {est_str}")
         data = _post_json(base_url.rstrip("/") + "/images/edits", key, payload,
                           timeout_seconds, tag)
         items = data.get("data") or []
         if not items:
             raise RuntimeError(f"[{tag}] Empty response: {str(data)[:500]}")
         arrays = [_b64_or_url_to_array(it, timeout_seconds) for it in items]
-        info = _summarize_image_info(data, model_id, tag)
-        print(f"[{tag}] <- {len(arrays)} result(s). {info}")
+        info = _image_result_info(data, arrays, model_id, resolution, quality, est, tag,
+                                  fail_on_moderation, n_inputs=len(uris))
+        print(f"[{tag}] <- {info}")
         return (_stack_images(arrays), prompt, info)
 
 
@@ -612,6 +795,18 @@ class GrokImagineEdit:
 # ---------------------------------------------------------------------------
 VIDEO_RETURN_TYPES = ("IMAGE", "FLOAT", "AUDIO", "VIDEO", "STRING", "STRING", "STRING")
 VIDEO_RETURN_NAMES = ("frames", "fps", "audio", "video", "video_path", "prompt", "info")
+VIDEO_OUTPUT_TOOLTIPS = (
+    "All decoded frames as an IMAGE batch (empty 64x64 placeholder if extract_frames is off).",
+    "Frame rate of the MP4 as reported by the decoder - connect to Save/Combine nodes.",
+    "Decoded soundtrack as AUDIO (silent placeholder if the file has no audio or "
+    "extract_audio is off). Works with Save Video / Video Combine audio inputs.",
+    "Native ComfyUI VIDEO object (file-backed) for Save Video, Preview Video, Get "
+    "Video Components. None on very old ComfyUI builds.",
+    "Local path of the downloaded MP4 in ComfyUI/output/grok_imagine - connect to "
+    "Video Save Plus (source_video_path) for a lossless copy, or to Video Edit/Extend.",
+    "The prompt exactly as sent, for Save nodes (prompt_text) or captions.",
+    "Facts about the job: model used, duration, moderation flag, request_id, billed cost.",
+)
 
 
 def _video_common_optional():
@@ -631,6 +826,7 @@ class GrokImagineVideo:
     CATEGORY = "Grok/Imagine"
     RETURN_TYPES = VIDEO_RETURN_TYPES
     RETURN_NAMES = VIDEO_RETURN_NAMES
+    OUTPUT_TOOLTIPS = VIDEO_OUTPUT_TOOLTIPS
     FUNCTION = "generate"
 
     @classmethod
@@ -751,6 +947,7 @@ class GrokImagineVideoEdit:
     CATEGORY = "Grok/Imagine"
     RETURN_TYPES = VIDEO_RETURN_TYPES
     RETURN_NAMES = VIDEO_RETURN_NAMES
+    OUTPUT_TOOLTIPS = VIDEO_OUTPUT_TOOLTIPS
     FUNCTION = "edit"
 
     @classmethod
@@ -825,6 +1022,7 @@ class GrokImagineVideoExtend:
     CATEGORY = "Grok/Imagine"
     RETURN_TYPES = VIDEO_RETURN_TYPES
     RETURN_NAMES = VIDEO_RETURN_NAMES
+    OUTPUT_TOOLTIPS = VIDEO_OUTPUT_TOOLTIPS
     FUNCTION = "extend"
 
     @classmethod
@@ -884,6 +1082,7 @@ class GrokSaveVideo:
     CATEGORY = "Grok/Imagine"
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("saved_path",)
+    OUTPUT_TOOLTIPS = ("Full path of the copied MP4 (with the final, de-duplicated name).",)
     FUNCTION = "save"
     OUTPUT_NODE = True
 

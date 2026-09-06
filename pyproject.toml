@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-grok-imagine-video"
-description = "ComfyUI custom nodes for the official xAI Grok Imagine API: image generation (grok-imagine-image-2.0, quality tiers), editing with up to 5 source images, video generation with every option (image-to-video, reference-to-video, voices, 1080p, 15 s, audio), video editing and extension, native VIDEO/AUDIO outputs, and saving videos + prompt + workflow to any path."
-version = "2.0.0"
+description = "ComfyUI nodes for the xAI Grok Imagine API: image generation (grok-imagine-image-2.0, quality tiers), editing with up to 5 images, video generation with all options (image/reference-to-video, voices, 1080p, 15 s, audio), video edit/extend, native VIDEO/AUDIO outputs, save video + prompt + workflow to any path."
+version = "2.1.0"
 license = { file = "LICENSE" }
 dependencies = ["requests>=2.28", "numpy>=1.24", "Pillow>=9.0", "imageio>=2.31", "imageio-ffmpeg>=0.4.9"]
 
