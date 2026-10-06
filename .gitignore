@@ -1,6 +1,5 @@
 __pycache__/
 *.pyc
 grok_api_key.txt
-*.txt.txt
 .DS_Store
 Thumbs.db

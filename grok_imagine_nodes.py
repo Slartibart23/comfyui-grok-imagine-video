@@ -3,7 +3,21 @@ Grok Imagine — ComfyUI custom nodes
 Image generation, multi-image editing, video generation / editing / extension
 via the official xAI Grok Imagine API.
 
-v2.1.0 (September 2026)
+v3.0.0 (September 2026)
+- Nothing is written to the ComfyUI output folder any more: videos are
+  downloaded to a temp folder and MOVED by the new Grok Video Save node to a
+  folder + filename of your choice (numbered name_000000, never overwrites),
+  with optional prompt .txt, workflow .json and base image .jpg.
+- New Grok Image Save node with the same behaviour for image batches.
+- Previews: video nodes show the downloaded clip with sound directly in the
+  node; save nodes show preview + buttons (Reveal in Explorer, Open,
+  Save Last Frame, Delete). Every API node shows a status line with the
+  billed cost.
+- Registry-ready (pyproject PublisherId, publish workflow, example workflows).
+v2.1.1
+- Stale widget values from pre-2.1 node instances (e.g. custom_model='300')
+  no longer override the model dropdown.
+v2.1.0
 - Image: `resolution` (1k/2k) now also on the Edit node; explicit `quality`
   defaults (low for generation, medium for editing) so the billed tier is
   visible; cost estimate before every request and the real billed cost after;
@@ -39,6 +53,8 @@ import time
 import wave
 
 import requests
+
+__version__ = "3.0.0"
 
 # ---------------------------------------------------------------------------
 # MODEL LISTS — edit when xAI ships new models, then restart ComfyUI.
@@ -134,15 +150,25 @@ def _find_comfy_root():
     return candidate if os.path.isdir(candidate) else os.getcwd()
 
 
-def _output_dir():
-    try:
-        import folder_paths
-        base = folder_paths.get_output_directory()
-    except Exception:
-        base = os.path.join(_find_comfy_root(), "output")
-    d = os.path.join(base, "grok_imagine")
+def _download_dir(custom=""):
+    """Where finished videos are downloaded BEFORE a save node moves them to
+    their final place. Default: <system temp>/grok_imagine - never the
+    ComfyUI output folder."""
+    c = (custom or "").strip().strip('"')
+    d = os.path.abspath(os.path.expanduser(c)) if c else os.path.join(tempfile.gettempdir(), "grok_imagine")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def _temp_folder_report():
+    d = os.path.join(tempfile.gettempdir(), "grok_imagine")
+    if os.path.isdir(d):
+        files = [os.path.join(d, f) for f in os.listdir(d) if f.lower().endswith(".mp4")]
+        if files:
+            mb = sum(os.path.getsize(f) for f in files) / (1024 * 1024)
+            print(f"[Grok Imagine] {len(files)} unsaved video(s), {mb:.0f} MB, still in "
+                  f"{d} - they are moved out when you run Grok Video Save, or you can "
+                  f"delete the folder.")
 
 
 def _resolve_api_key(api_key_widget, api_key_file):
@@ -174,7 +200,19 @@ def _resolve_api_key(api_key_widget, api_key_file):
 
 
 def _pick_model(dropdown, custom_model):
-    return custom_model.strip() if custom_model and custom_model.strip() else dropdown
+    """custom_model overrides the dropdown - unless it is obviously not a model
+    ID (e.g. a bare number). That happens when an old node instance from a
+    workflow saved with an earlier version has its widget values shifted after
+    new widgets were added; then the stale value is ignored with a warning."""
+    c = (custom_model or "").strip()
+    if not c:
+        return dropdown
+    if not any(ch.isalpha() for ch in c) or len(c) < 4:
+        print(f"[Grok Imagine] custom_model='{c}' is not a valid model ID - ignoring it "
+              f"and using '{dropdown}'. This usually means the node was saved with an "
+              f"older version: delete and re-add the node so the widget values line up.")
+        return dropdown
+    return c
 
 
 def _to_numpy(image):
@@ -485,12 +523,12 @@ def _submit_and_poll(base, key, endpoint, payload, tag, poll_interval,
                        f"Raise poll_timeout_seconds for long jobs.")
 
 
-def _download_video(result, request_id, tag, prefix="grok_video"):
+def _download_video(result, request_id, tag, prefix="grok_video", download_folder=""):
     video = result.get("video") or {}
     url = video.get("url")
     if not url:
         raise RuntimeError(f"[{tag}] No video url in: {str(result)[:500]}")
-    path = os.path.join(_output_dir(), f"{prefix}_{request_id}.mp4")
+    path = os.path.join(_download_dir(download_folder), f"{prefix}_{request_id}.mp4")
     with requests.get(url, stream=True, timeout=600) as dl:
         dl.raise_for_status()
         with open(path, "wb") as f:
@@ -661,7 +699,7 @@ class GrokImagineGenerate:
         info = _image_result_info(data, arrays, model_id, resolution, quality, est, tag,
                                   fail_on_moderation)
         print(f"[{tag}] <- {info}")
-        return (_stack_images(arrays), prompt, info)
+        return {"ui": {"grok_status": [info]}, "result": (_stack_images(arrays), prompt, info)}
 
 
 # ---------------------------------------------------------------------------
@@ -787,7 +825,7 @@ class GrokImagineEdit:
         info = _image_result_info(data, arrays, model_id, resolution, quality, est, tag,
                                   fail_on_moderation, n_inputs=len(uris))
         print(f"[{tag}] <- {info}")
-        return (_stack_images(arrays), prompt, info)
+        return {"ui": {"grok_status": [info]}, "result": (_stack_images(arrays), prompt, info)}
 
 
 # ---------------------------------------------------------------------------
@@ -802,8 +840,8 @@ VIDEO_OUTPUT_TOOLTIPS = (
     "extract_audio is off). Works with Save Video / Video Combine audio inputs.",
     "Native ComfyUI VIDEO object (file-backed) for Save Video, Preview Video, Get "
     "Video Components. None on very old ComfyUI builds.",
-    "Local path of the downloaded MP4 in ComfyUI/output/grok_imagine - connect to "
-    "Video Save Plus (source_video_path) for a lossless copy, or to Video Edit/Extend.",
+    "Path of the downloaded MP4 in the temp folder - connect to Grok Video Save, "
+    "which moves it to your folder without re-encoding, or to Video Edit / Extend.",
     "The prompt exactly as sent, for Save nodes (prompt_text) or captions.",
     "Facts about the job: model used, duration, moderation flag, request_id, billed cost.",
 )
@@ -819,7 +857,25 @@ def _video_common_optional():
         "base_url": ("STRING", {"default": DEFAULT_BASE_URL, "tooltip": TT_BASE_URL}),
         "poll_interval_seconds": ("INT", {"default": 5, "min": 2, "max": 60, "tooltip": TT_POLL_INT}),
         "poll_timeout_seconds": ("INT", {"default": 900, "min": 60, "max": 7200, "tooltip": TT_POLL_TO}),
+        "download_folder": ("STRING", {"default": "", "tooltip":
+            "Where the finished MP4 is downloaded BEFORE you save it. Empty = the "
+            "Windows temp folder (<Temp>\\grok_imagine). Grok Video Save MOVES the file "
+            "from here to your final folder, so nothing piles up. Never the ComfyUI "
+            "output folder."}),
+        "show_preview": ("BOOLEAN", {"default": True, "tooltip":
+            "Show the finished video with sound directly in this node after the run - "
+            "handy for checking before you save. No file is written for this."}),
     }
+
+
+def _video_ui(video_path, info, unique_id, show_preview):
+    """ui payload for the inline preview + status line (rendered by web/grok_imagine.js)."""
+    ui = {"grok_status": [info]}
+    if show_preview and video_path and os.path.isfile(video_path):
+        from .grok_save_nodes import register_preview_file
+        ui["grok_video"] = [{"token": register_preview_file(video_path),
+                             "node_id": str(unique_id)}]
+    return ui
 
 
 class GrokImagineVideo:
@@ -827,6 +883,7 @@ class GrokImagineVideo:
     RETURN_TYPES = VIDEO_RETURN_TYPES
     RETURN_NAMES = VIDEO_RETURN_NAMES
     OUTPUT_TOOLTIPS = VIDEO_OUTPUT_TOOLTIPS
+    OUTPUT_NODE = True  # runs even with nothing connected, so the preview shows
     FUNCTION = "generate"
 
     @classmethod
@@ -883,6 +940,7 @@ class GrokImagineVideo:
                     "fixed = re-use the cached result for identical settings (no cost)."}),
             },
             "optional": opt,
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     def generate(self, prompt, model, duration, aspect_ratio, resolution, seed=0,
@@ -890,7 +948,8 @@ class GrokImagineVideo:
                  image_max_side=2048, extract_frames=True, extract_audio=True,
                  custom_model="", api_key="", api_key_file=DEFAULT_KEY_FILE,
                  base_url=DEFAULT_BASE_URL, poll_interval_seconds=5,
-                 poll_timeout_seconds=900):
+                 poll_timeout_seconds=900, download_folder="", show_preview=True,
+                 unique_id=None):
         tag = "Grok Imagine Video"
         key = _resolve_api_key(api_key, api_key_file)
         base = base_url.rstrip("/")
@@ -931,13 +990,15 @@ class GrokImagineVideo:
         result, request_id = _submit_and_poll(base, key, "/videos/generations", payload,
                                               tag, poll_interval_seconds,
                                               poll_timeout_seconds)
-        video_path, video = _download_video(result, request_id, tag)
+        video_path, video = _download_video(result, request_id, tag,
+                                            download_folder=download_folder)
         info = _video_info(result, video, model_id, request_id)
         print(f"[{tag}] <- {info}")
         frames, fps, audio, video_obj = _video_outputs(video_path, extract_frames,
                                                        extract_audio,
                                                        video.get("duration", duration))
-        return (frames, fps, audio, video_obj, video_path, prompt, info)
+        return {"ui": _video_ui(video_path, info, unique_id, show_preview),
+                "result": (frames, fps, audio, video_obj, video_path, prompt, info)}
 
 
 # ---------------------------------------------------------------------------
@@ -948,6 +1009,7 @@ class GrokImagineVideoEdit:
     RETURN_TYPES = VIDEO_RETURN_TYPES
     RETURN_NAMES = VIDEO_RETURN_NAMES
     OUTPUT_TOOLTIPS = VIDEO_OUTPUT_TOOLTIPS
+    OUTPUT_NODE = True  # runs even with nothing connected, so the preview shows
     FUNCTION = "edit"
 
     @classmethod
@@ -975,12 +1037,14 @@ class GrokImagineVideoEdit:
                     "Cache-breaker only (not sent)."}),
             },
             "optional": opt,
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     def edit(self, video_path, prompt, model, seed=0, video_url="", extract_frames=True,
              extract_audio=True, custom_model="", api_key="",
              api_key_file=DEFAULT_KEY_FILE, base_url=DEFAULT_BASE_URL,
-             poll_interval_seconds=5, poll_timeout_seconds=900):
+             poll_interval_seconds=5, poll_timeout_seconds=900, download_folder="",
+             show_preview=True, unique_id=None):
         tag = "Grok Imagine Video Edit"
         key = _resolve_api_key(api_key, api_key_file)
         base = base_url.rstrip("/")
@@ -991,12 +1055,14 @@ class GrokImagineVideoEdit:
         result, request_id = _submit_and_poll(base, key, "/videos/edits", payload, tag,
                                               poll_interval_seconds, poll_timeout_seconds,
                                               submit_timeout=600)
-        out_path, video = _download_video(result, request_id, tag, prefix="grok_edit")
+        out_path, video = _download_video(result, request_id, tag, prefix="grok_edit",
+                                          download_folder=download_folder)
         info = _video_info(result, video, model_id, request_id)
         print(f"[{tag}] <- {info}")
         frames, fps, audio, video_obj = _video_outputs(out_path, extract_frames,
                                                        extract_audio, video.get("duration", 5))
-        return (frames, fps, audio, video_obj, out_path, prompt, info)
+        return {"ui": _video_ui(out_path, info, unique_id, show_preview),
+                "result": (frames, fps, audio, video_obj, out_path, prompt, info)}
 
 
 def _video_source(video_path, video_url, tag):
@@ -1023,6 +1089,7 @@ class GrokImagineVideoExtend:
     RETURN_TYPES = VIDEO_RETURN_TYPES
     RETURN_NAMES = VIDEO_RETURN_NAMES
     OUTPUT_TOOLTIPS = VIDEO_OUTPUT_TOOLTIPS
+    OUTPUT_NODE = True  # runs even with nothing connected, so the preview shows
     FUNCTION = "extend"
 
     @classmethod
@@ -1050,12 +1117,14 @@ class GrokImagineVideoExtend:
                     "Cache-breaker only (not sent)."}),
             },
             "optional": opt,
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     def extend(self, video_path, prompt, model, duration, seed=0, video_url="",
                extract_frames=True, extract_audio=True, custom_model="", api_key="",
                api_key_file=DEFAULT_KEY_FILE, base_url=DEFAULT_BASE_URL,
-               poll_interval_seconds=5, poll_timeout_seconds=900):
+               poll_interval_seconds=5, poll_timeout_seconds=900, download_folder="",
+               show_preview=True, unique_id=None):
         tag = "Grok Imagine Video Extend"
         key = _resolve_api_key(api_key, api_key_file)
         base = base_url.rstrip("/")
@@ -1067,99 +1136,14 @@ class GrokImagineVideoExtend:
         result, request_id = _submit_and_poll(base, key, "/videos/extensions", payload,
                                               tag, poll_interval_seconds,
                                               poll_timeout_seconds, submit_timeout=600)
-        out_path, video = _download_video(result, request_id, tag, prefix="grok_extend")
+        out_path, video = _download_video(result, request_id, tag, prefix="grok_extend",
+                                          download_folder=download_folder)
         info = _video_info(result, video, model_id, request_id)
         print(f"[{tag}] <- {info}")
         frames, fps, audio, video_obj = _video_outputs(out_path, extract_frames,
                                                        extract_audio, video.get("duration", duration))
-        return (frames, fps, audio, video_obj, out_path, prompt, info)
-
-
-# ---------------------------------------------------------------------------
-# Node 6 — Save video to any folder on any drive with a custom filename
-# ---------------------------------------------------------------------------
-class GrokSaveVideo:
-    CATEGORY = "Grok/Imagine"
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("saved_path",)
-    OUTPUT_TOOLTIPS = ("Full path of the copied MP4 (with the final, de-duplicated name).",)
-    FUNCTION = "save"
-    OUTPUT_NODE = True
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "video_path": ("STRING", {"forceInput": True, "tooltip":
-                    "Connect the video_path output of a Grok video node (the downloaded "
-                    "MP4 in ComfyUI/output/grok_imagine)."}),
-                "output_dir": ("STRING", {"default": "D:/grok_videos", "tooltip":
-                    "Destination folder on any drive, e.g. O:\\projects\\clips. Created "
-                    "if missing."}),
-                "filename": ("STRING", {"default": "my_video", "tooltip":
-                    "File name without extension (.mp4 is added). Illegal characters "
-                    "are replaced by '_'."}),
-            },
-            "optional": {
-                "overwrite": ("BOOLEAN", {"default": False, "tooltip":
-                    "Off: an existing name gets _001, _002... appended. On: replace."}),
-                "prompt_text": ("STRING", {"default": "", "forceInput": True, "tooltip":
-                    "Connect the 'prompt' output of the video node to also write "
-                    "<filename>_prompt.txt next to the video."}),
-                "save_prompt_txt": ("BOOLEAN", {"default": True, "tooltip":
-                    "Write <filename>_prompt.txt when prompt_text is connected."}),
-                "save_workflow_json": ("BOOLEAN", {"default": True, "tooltip":
-                    "Write <filename>_workflow.json (the full ComfyUI workflow, loadable "
-                    "via drag & drop) next to the video."}),
-            },
-            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
-        }
-
-    def save(self, video_path, output_dir, filename, overwrite=False, prompt_text="",
-             save_prompt_txt=True, save_workflow_json=True, prompt=None,
-             extra_pnginfo=None):
-        tag = "Grok Save Video"
-        src = video_path.strip().strip('"')
-        if not os.path.isfile(src):
-            raise RuntimeError(f"[{tag}] Source not found: {src}")
-
-        out_dir = output_dir.strip().strip('"')
-        os.makedirs(out_dir, exist_ok=True)
-
-        name = re.sub(r'[<>:"/\\|?*]', "_", filename.strip()) or "grok_video"
-        ext = os.path.splitext(src)[1] or ".mp4"
-        if name.lower().endswith(ext.lower()):
-            name = name[:-len(ext)]
-
-        stem = name
-        dest = os.path.join(out_dir, stem + ext)
-        if os.path.exists(dest) and not overwrite:
-            i = 1
-            while os.path.exists(os.path.join(out_dir, f"{name}_{i:03d}{ext}")):
-                i += 1
-            stem = f"{name}_{i:03d}"
-            dest = os.path.join(out_dir, stem + ext)
-
-        shutil.copy2(src, dest)
-        print(f"[{tag}] Saved -> {dest}")
-
-        if save_prompt_txt and (prompt_text or "").strip():
-            p = os.path.join(out_dir, f"{stem}_prompt.txt")
-            with open(p, "w", encoding="utf-8") as f:
-                f.write(prompt_text.strip() + "\n")
-            print(f"[{tag}] Prompt -> {p}")
-
-        if save_workflow_json:
-            wf = None
-            if isinstance(extra_pnginfo, dict):
-                wf = extra_pnginfo.get("workflow")
-            if wf is not None or prompt is not None:
-                p = os.path.join(out_dir, f"{stem}_workflow.json")
-                with open(p, "w", encoding="utf-8") as f:
-                    json.dump(wf if wf is not None else {"prompt": prompt}, f,
-                              indent=2, ensure_ascii=False)
-                print(f"[{tag}] Workflow -> {p}")
-        return {"ui": {"text": [f"Saved: {dest}"]}, "result": (dest,)}
+        return {"ui": _video_ui(out_path, info, unique_id, show_preview),
+                "result": (frames, fps, audio, video_obj, out_path, prompt, info)}
 
 
 NODE_CLASS_MAPPINGS = {
@@ -1168,7 +1152,6 @@ NODE_CLASS_MAPPINGS = {
     "GrokImagineVideo": GrokImagineVideo,
     "GrokImagineVideoEdit": GrokImagineVideoEdit,
     "GrokImagineVideoExtend": GrokImagineVideoExtend,
-    "GrokSaveVideo": GrokSaveVideo,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1177,5 +1160,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "GrokImagineVideo": "Grok Imagine Video (xAI)",
     "GrokImagineVideoEdit": "Grok Imagine Video Edit (xAI)",
     "GrokImagineVideoExtend": "Grok Imagine Video Extend (xAI)",
-    "GrokSaveVideo": "Grok Save Video To Path",
 }

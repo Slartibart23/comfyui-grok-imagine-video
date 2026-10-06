@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.0.0 — 2026-09-25
+- **No more files in the ComfyUI output folder.** Videos download to `%TEMP%\grok_imagine`; *Grok Video Save* MOVES them to a folder and filename of your choice.
+- **Grok Video Save 🎬** (replaces *Grok Save Video To Path*): `folder`, `filename` (+ connectable `filename_input`), numbering `name_000000` continuing from the highest existing number, never overwrites; optional `name.txt` (prompt), `name.json` (workflow), `name_base.jpg` (start image); preview with sound; buttons Reveal in Explorer / Open video / Save Last Frame / Delete this set.
+- **Grok Image Save 🖼**: same behaviour for image batches (PNG with embedded workflow or JPG), preview + buttons.
+- Video nodes show the finished clip with sound directly in the node (`show_preview`); every API node shows a status line with the billed cost.
+- Registry-ready: `pyproject.toml` (PublisherId `slartibart23b`), publish workflow, `.comfyignore`, two example workflows.
+- Legacy class ID `GrokSaveVideo` still loads (maps to Grok Video Save) - re-add the node once to get the new widgets.
+
+## 2.1.1 — 2026-09-06
+- `custom_model` values that are not a plausible model ID (e.g. a bare number left over from a node instance saved with an older version) are ignored with a console hint instead of being sent to the API.
+
 ## 2.1.0 — 2026-09-06
 - **Edit node:** new `resolution` widget (`source` / `1k` / `2k`) — was missing in 2.0.0.
 - **Cost transparency:** estimated cost from xAI list prices printed before every image request (inputs x $0.01 + outputs by tier); real billed cost from `cost_in_usd_ticks` on `info`.
